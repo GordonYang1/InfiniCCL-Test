@@ -1,4 +1,8 @@
 # Prerequisites
+/build/
+/install/
+include/infiniccl.h
+cluster.yaml
 *.d
 
 # Compiled Object files
