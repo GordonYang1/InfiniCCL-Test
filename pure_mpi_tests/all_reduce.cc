@@ -1,137 +1,329 @@
-/**
- * InfiniCCL Example: AllReduce
- * * This example demonstrates the planned API for performing a
- * collective sum-reduction across multiple GPUs and nodes.
- */
-
-#include <iostream>
 #include <unistd.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include <infiniccl/infiniccl.h>
 
 #include "runtime_api.h"
-#include "utils.h"
 
-void RunAllReduceExample(int argc, char **argv, int warmup_iter,
-                         int profile_iter, const size_t kNumElements) {
-  CHECK_INFINI(infinicclInit(&argc, &argv));
+namespace {
 
-  int rank, size;
-  CHECK_INFINI(infinicclGetRank(&rank));
-  CHECK_INFINI(infinicclGetSize(&size));
+struct Options {
+  std::string dtype = "float32";
+  std::string red_op = "sum";
+  size_t count = 1024;
+  bool pin_device0 = false;
+};
+
+void PrintUsage(const char *program) {
+  std::cerr << "Usage: " << program << " --dtype <int32|float32|float64>"
+            << " --red-op <sum|prod|max|min|avg>"
+            << " --count <N>"
+            << " [--pin-device0 <0|1>]" << std::endl;
+}
+
+bool ParseBool(const std::string &value, bool *out) {
+  if (value == "1" || value == "true" || value == "on") {
+    *out = true;
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+bool ParseSize(const std::string &value, size_t *out) {
+  char *end = nullptr;
+  unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+  if (end == value.c_str() || *end != '\0' || parsed == 0) {
+    return false;
+  }
+  *out = static_cast<size_t>(parsed);
+  return true;
+}
+
+bool ParseArgs(int argc, char **argv, Options *opts) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    auto require_value = [&](const char *name) -> const char * {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value for `" << name << "`." << std::endl;
+        return nullptr;
+      }
+      return argv[++i];
+    };
+
+    if (arg == "--help" || arg == "-h") {
+      PrintUsage(argv[0]);
+      std::exit(EXIT_SUCCESS);
+    } else if (arg == "--dtype") {
+      const char *value = require_value("--dtype");
+      if (!value)
+        return false;
+      opts->dtype = value;
+    } else if (arg == "--red-op") {
+      const char *value = require_value("--red-op");
+      if (!value)
+        return false;
+      opts->red_op = value;
+    } else if (arg == "--count") {
+      const char *value = require_value("--count");
+      if (!value)
+        return false;
+      if (!ParseSize(value, &opts->count)) {
+        std::cerr << "`--count` must be a positive integer." << std::endl;
+        return false;
+      }
+    } else if (arg == "--pin-device0") {
+      const char *value = require_value("--pin-device0");
+      if (!value)
+        return false;
+      if (!ParseBool(value, &opts->pin_device0)) {
+        std::cerr << "`--pin-device0` must be 0/1, true/false, or on/off."
+                  << std::endl;
+        return false;
+      }
+    } else {
+      std::cerr << "Unknown argument `" << arg << "`." << std::endl;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool ParseRedOp(const std::string &name, infinicclRedOp_t *op) {
+  if (name == "sum") {
+    *op = infinicclSum;
+  } else if (name == "prod") {
+    *op = infinicclProd;
+  } else if (name == "max") {
+    *op = infinicclMax;
+  } else if (name == "min") {
+    *op = infinicclMin;
+  } else if (name == "avg") {
+    *op = infinicclAvg;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+int LocalRankFromEnv() {
+  const char *env_names[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID",
+                             "MV2_COMM_WORLD_LOCAL_RANK"};
+  for (const char *env_name : env_names) {
+    const char *value = std::getenv(env_name);
+    if (value != nullptr) {
+      return std::atoi(value);
+    }
+  }
+  return 0;
+}
+
+bool CheckInfini(infinicclResult_t result, const char *expr, int line) {
+  if (result == infinicclSuccess) {
+    return true;
+  }
+  std::cerr << "[InfiniCCL Error] `" << expr << "` returned " << result
+            << " at line " << line << "." << std::endl;
+  return false;
+}
+
+#define CHECK_INFINI_OR_RETURN(expr)                                           \
+  do {                                                                         \
+    if (!CheckInfini((expr), #expr, __LINE__)) {                               \
+      return EXIT_FAILURE;                                                     \
+    }                                                                          \
+  } while (0)
+
+template <typename T> T InputValueForRank(int rank) {
+  return static_cast<T>(rank + 1);
+}
+
+template <typename T> T ExpectedValue(int world_size, infinicclRedOp_t op) {
+  double sum = 0.0;
+  double product = 1.0;
+  for (int rank = 0; rank < world_size; ++rank) {
+    double value = static_cast<double>(rank + 1);
+    sum += value;
+    product *= value;
+  }
+
+  switch (op) {
+  case infinicclSum:
+    return static_cast<T>(sum);
+  case infinicclProd:
+    return static_cast<T>(product);
+  case infinicclMax:
+    return static_cast<T>(world_size);
+  case infinicclMin:
+    return static_cast<T>(1);
+  case infinicclAvg:
+    return static_cast<T>(sum / static_cast<double>(world_size));
+  default:
+    return static_cast<T>(0);
+  }
+}
+
+template <typename T> bool EqualEnough(T actual, T expected) {
+  if constexpr (std::is_integral_v<T>) {
+    return actual == expected;
+  } else {
+    double diff =
+        std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+    return diff <= 1e-3;
+  }
+}
+
+template <typename T>
+bool ValidateAllReduce(const std::vector<T> &data, T expected, int rank,
+                       const Options &opts) {
+  bool correct = true;
+  size_t error_count = 0;
+
+  for (size_t i = 0; i < data.size(); ++i) {
+    if (!EqualEnough(data[i], expected)) {
+      correct = false;
+      ++error_count;
+      if (rank == 0 && error_count <= 3) {
+        std::cerr << "Mismatch at index " << i << ": got "
+                  << static_cast<double>(data[i]) << ", expected "
+                  << static_cast<double>(expected) << "." << std::endl;
+      }
+    }
+  }
+
+  if (rank == 0) {
+    const char *green = "\033[32m";
+    const char *red = "\033[31m";
+    const char *reset = "\033[0m";
+
+    std::cout << "\n=== AllReduce Test Results ===" << std::endl;
+    std::cout << "Case: dtype=" << opts.dtype << ", red-op=" << opts.red_op
+              << ", count=" << opts.count << std::endl;
+    std::cout << "Correct: "
+              << (correct ? (green + std::string("YES") + reset)
+                          : (red + std::string("NO") + reset));
+    if (!correct) {
+      std::cout << " (" << error_count << " errors)";
+    }
+    std::cout << std::endl;
+    if (!data.empty()) {
+      std::cout << "Expect:  " << static_cast<double>(expected) << std::endl;
+      std::cout << "Actual:  " << static_cast<double>(data[0]) << std::endl;
+    }
+  }
+
+  return correct;
+}
+
+template <typename T>
+int RunAllReduce(int argc, char **argv, const Options &opts,
+                 infinicclDataType_t data_type, infinicclRedOp_t red_op) {
+  if (opts.count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+    std::cerr << "Requested element count overflows byte size." << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  CHECK_INFINI_OR_RETURN(infinicclInit(&argc, &argv));
+
+  int rank = 0;
+  int world_size = 0;
+  CHECK_INFINI_OR_RETURN(infinicclGetRank(&rank));
+  CHECK_INFINI_OR_RETURN(infinicclGetSize(&world_size));
 
   char hostname[256];
   gethostname(hostname, sizeof(hostname));
 
-  // Map local rank to GPU device.
-  // Note: this is just for info printing. In practice, this part is not needed.
-  const char *local_rank_str = std::getenv("OMPI_COMM_WORLD_LOCAL_RANK");
-  int local_rank = 0;
-  if (local_rank_str != nullptr) {
-    local_rank = std::atoi(local_rank_str);
-  }
-
-  CHECK_DEVICE(GPU_SET_DEVICE(local_rank));
+  int device_id = opts.pin_device0 ? 0 : LocalRankFromEnv();
+  CHECK_DEVICE(GPU_SET_DEVICE(device_id));
   CHECK_DEVICE(GPU_SYNC());
 
-  // Get GPU info
   gpuProp_t prop;
-  CHECK_DEVICE(GPU_GET_DEVICE_PROPS(&prop, local_rank));
+  CHECK_DEVICE(GPU_GET_DEVICE_PROPS(&prop, device_id));
 
   std::cout << "[Rank " << rank << "] Host: " << hostname
             << " | GPU: " << GPU_PLATFORM << " " << prop.name << " | Device "
-            << local_rank << std::endl;
+            << device_id << std::endl;
 
-  // Setup Communicator
   infinicclComm_t comm = nullptr;
-  CHECK_INFINI(infinicclCommInitAll(&comm, size, nullptr));
-
-  // Prepare Data
-  std::vector<float> h_send(kNumElements);
-  std::vector<float> h_recv(kNumElements, 0.0f);
-
-  // Initialize: each rank provides its (rank + 1) as data
-  for (size_t i = 0; i < kNumElements; i++) {
-    h_send[i] = static_cast<float>(rank + 1);
+  std::vector<int> device_ids;
+  const int *device_list = nullptr;
+  if (opts.pin_device0) {
+    device_ids.assign(static_cast<size_t>(world_size), 0);
+    device_list = device_ids.data();
   }
+  CHECK_INFINI_OR_RETURN(
+      infinicclCommInitAll(&comm, world_size, device_list));
 
-  float *d_send = nullptr, *d_recv = nullptr;
-  size_t total_bytes = kNumElements * sizeof(*d_send);
+  std::vector<T> h_send(opts.count, InputValueForRank<T>(rank));
+  std::vector<T> h_recv(opts.count, static_cast<T>(0));
+
+  T *d_send = nullptr;
+  T *d_recv = nullptr;
+  size_t total_bytes = opts.count * sizeof(T);
   CHECK_DEVICE(GPU_MALLOC(&d_send, total_bytes));
   CHECK_DEVICE(GPU_MALLOC(&d_recv, total_bytes));
   CHECK_DEVICE(GPU_MEMCPY_H2D(d_send, h_send.data(), total_bytes));
   CHECK_DEVICE(GPU_MEMCPY_H2D(d_recv, h_recv.data(), total_bytes));
-
-  if (rank == 0) {
-    std::cout << "\n=== Performing AllReduce on GPU Memory ===" << std::endl;
-    std::cout << "Data size: " << kNumElements << " floats ("
-              << total_bytes / 1024 / 1024 << " MB)" << std::endl;
-    std::cout << "Operation: Sum" << std::endl;
-    std::cout << "Warm-up iterations: " << warmup_iter << std::endl;
-    std::cout << "Profile iterations: " << profile_iter << std::endl;
-  }
-
-  GPU_SYNC();
-
-  // warm-up and D2H transfer the answer
-  CHECK_INFINI(infinicclAllReduce(d_send, d_recv, kNumElements,
-                                  infinicclFloat32, infinicclSum, comm,
-                                  nullptr));
-  CHECK_DEVICE(
-      GPU_MEMCPY_D2H(h_recv.data(), d_recv, kNumElements * sizeof(float)));
-
-  for (int i = 1; i < warmup_iter; ++i) {
-    CHECK_INFINI(infinicclAllReduce(d_send, d_recv, kNumElements,
-                                    infinicclFloat32, infinicclSum, comm,
-                                    nullptr));
-  }
   CHECK_DEVICE(GPU_SYNC());
 
-  // Profiling
-  Timer timer;
-
-  for (int i = 0; i < profile_iter; i++) {
-    CHECK_INFINI(infinicclAllReduce(d_send, d_recv, kNumElements,
-                                    infinicclFloat32, infinicclSum, comm,
-                                    nullptr));
-  }
-
+  CHECK_INFINI_OR_RETURN(infinicclAllReduce(d_send, d_recv, opts.count,
+                                            data_type, red_op, comm, nullptr));
   CHECK_DEVICE(GPU_SYNC());
-  double elapsed = timer.elapsed_ms() / static_cast<double>(profile_iter);
+  CHECK_DEVICE(GPU_MEMCPY_D2H(h_recv.data(), d_recv, total_bytes));
 
-  // Result Validation
-  float expected = 0.0f;
-  for (int r = 0; r < size; r++) {
-    expected += static_cast<float>(r + 1);
-  }
+  T expected = ExpectedValue<T>(world_size, red_op);
+  bool correct = ValidateAllReduce(h_recv, expected, rank, opts);
 
-  Validator::ValidateResult(h_recv.data(), kNumElements, expected, rank);
-
-  // Metrics Reporting (Only from rank 0 for cleaner output)
-  if (rank == 0) {
-    Metrics metrics{elapsed, total_bytes, size};
-    metrics.Print();
-  }
-
-  // Cleanup
   CHECK_DEVICE(GPU_FREE(d_send));
   CHECK_DEVICE(GPU_FREE(d_recv));
+  CHECK_INFINI_OR_RETURN(infinicclCommDestroy(comm));
+  CHECK_INFINI_OR_RETURN(infinicclFinalize());
 
-  CHECK_INFINI(infinicclCommDestroy(comm));
-  CHECK_INFINI(infinicclFinalize());
-
-  if (rank == 0) {
-    std::cout << "InfiniCCL finalized." << std::endl;
-  }
+  return correct ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+} // namespace
+
 int main(int argc, char **argv) {
-  int warmup_iters = 2;
-  int profile_iters = 20;
-  size_t num_elements = 1 << 20;
+  Options opts;
+  if (!ParseArgs(argc, argv, &opts)) {
+    PrintUsage(argv[0]);
+    return EXIT_FAILURE;
+  }
 
-  RunAllReduceExample(argc, argv, warmup_iters, profile_iters, num_elements);
+  infinicclRedOp_t red_op = infinicclSum;
+  if (!ParseRedOp(opts.red_op, &red_op)) {
+    std::cerr << "Unsupported `--red-op` value `" << opts.red_op << "`."
+              << std::endl;
+    PrintUsage(argv[0]);
+    return EXIT_FAILURE;
+  }
 
-  return EXIT_SUCCESS;
+  if (opts.dtype == "float32") {
+    return RunAllReduce<float>(argc, argv, opts, infinicclFloat32, red_op);
+  }
+  if (opts.dtype == "float64") {
+    return RunAllReduce<double>(argc, argv, opts, infinicclFloat64, red_op);
+  }
+  if (opts.dtype == "int32") {
+    return RunAllReduce<int32_t>(argc, argv, opts, infinicclInt32, red_op);
+  }
+
+  std::cerr << "Unsupported `--dtype` value `" << opts.dtype
+            << "` in the initial all_reduce test." << std::endl;
+  PrintUsage(argv[0]);
+  return EXIT_FAILURE;
 }
