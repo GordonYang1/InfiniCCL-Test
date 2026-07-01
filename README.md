@@ -13,8 +13,9 @@ replacement for the main InfiniCCL README, build guide, or in-tree examples.
 The repository is still early in its test-framework setup.
 
 - `pure_mpi_tests/` contains the current MPI-backed test source.
-- CTest is wired for the initial pure MPI `all_reduce` smoke case:
-  `pure_mpi.all_reduce.float32.sum.count1024`.
+- CTest is wired for the pure MPI `all_reduce` smoke matrix across `int32`,
+  `float32`, `float64`, `sum`, `prod`, `max`, `min`, `avg`, and representative
+  element counts.
 - InfiniCCL is consumed with `find_package(InfiniCCL REQUIRED)`.
 - `INFINICCL_INSTALL` is still accepted as a backward-compatible search hint,
   but new builds should prefer `CMAKE_PREFIX_PATH` or `InfiniCCL_ROOT`.
@@ -132,12 +133,23 @@ Do not launch these tests with `mpirun` directly from this repository. `icclrun`
 generates the wrapper, hostfile, architecture-specific build path, and runtime
 environment expected by InfiniCCL.
 
-To run the registered CTest smoke case:
+To run the registered pure MPI `all_reduce` CTest matrix:
+
+```bash
+ctest --test-dir build/nvidia --output-on-failure \
+  -R '^pure_mpi\.all_reduce\.'
+```
+
+To run a single registered CTest case:
 
 ```bash
 ctest --test-dir build/nvidia --output-on-failure \
   -R '^pure_mpi\.all_reduce\.float32\.sum\.count1024$'
 ```
+
+The default matrix can be narrowed or expanded at configure time with
+`INFINICCL_TEST_ALL_REDUCE_DTYPES`, `INFINICCL_TEST_ALL_REDUCE_RED_OPS`, and
+`INFINICCL_TEST_ALL_REDUCE_COUNTS`.
 
 For a single local GPU, the default CTest registration pins all ranks to device
 0. For multi-GPU or heterogeneous runs, set

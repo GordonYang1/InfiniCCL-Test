@@ -12,6 +12,12 @@ option(INFINICCL_TEST_ENABLE_MIX "Enable reserved mixed-path tests" OFF)
 option(INFINICCL_TEST_PIN_ALL_RANKS_TO_DEVICE0 "Pin all ranks to device 0" ON)
 set(INFINICCL_TEST_CLUSTER_CONFIG "${CMAKE_SOURCE_DIR}/cluster.yaml" CACHE FILEPATH
     "Path to the local icclrun cluster.yaml used by CTest")
+set(INFINICCL_TEST_ALL_REDUCE_DTYPES "int32;float32;float64" CACHE STRING
+    "Pure MPI all_reduce dtypes with reliable typed reduction support")
+set(INFINICCL_TEST_ALL_REDUCE_RED_OPS "sum;prod;max;min;avg" CACHE STRING
+    "Pure MPI all_reduce reduction operations")
+set(INFINICCL_TEST_ALL_REDUCE_COUNTS "1;257;1024" CACHE STRING
+    "Pure MPI all_reduce element counts")
 
 find_program(INFINICCL_TEST_ICCLRUN_EXECUTABLE NAMES icclrun)
 if(NOT INFINICCL_TEST_ICCLRUN_EXECUTABLE)
@@ -81,6 +87,34 @@ include_directories(
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+function(infiniccl_add_pure_mpi_all_reduce_ctest)
+    foreach(dtype IN LISTS INFINICCL_TEST_ALL_REDUCE_DTYPES)
+        foreach(red_op IN LISTS INFINICCL_TEST_ALL_REDUCE_RED_OPS)
+            foreach(count IN LISTS INFINICCL_TEST_ALL_REDUCE_COUNTS)
+                set(test_case "pure_mpi.all_reduce.${dtype}.${red_op}.count${count}")
+                add_test(
+                    NAME ${test_case}
+                    COMMAND
+                        ${INFINICCL_TEST_ICCLRUN_EXECUTABLE}
+                        --config ${INFINICCL_TEST_CLUSTER_CONFIG}
+                        pure_mpi_tests/all_reduce
+                        --dtype ${dtype}
+                        --red-op ${red_op}
+                        --count ${count}
+                        --case basic
+                        --pin-device0 $<IF:$<BOOL:${INFINICCL_TEST_PIN_ALL_RANKS_TO_DEVICE0}>,1,0>
+                )
+                set_tests_properties(
+                    ${test_case}
+                    PROPERTIES
+                        LABELS "suite:pure_mpi;op:all_reduce;kind:reduction;dtype:${dtype};redop:${red_op};count:${count};size:smoke"
+                        SKIP_RETURN_CODE 77
+                )
+            endforeach()
+        endforeach()
+    endforeach()
+endfunction()
+
 # =========================================================
 # AUTOMATED BUILD EXECUTION LOOP
 # =========================================================
@@ -123,22 +157,7 @@ foreach(suite_dir ${TEST_SUITES})
                AND INFINICCL_TEST_ICCLRUN_EXECUTABLE
                AND suite_dir STREQUAL "pure_mpi_tests"
                AND test_stem STREQUAL "all_reduce")
-                add_test(
-                    NAME pure_mpi.all_reduce.float32.sum.count1024
-                    COMMAND
-                        ${INFINICCL_TEST_ICCLRUN_EXECUTABLE}
-                        --config ${INFINICCL_TEST_CLUSTER_CONFIG}
-                        pure_mpi_tests/all_reduce
-                        --dtype float32
-                        --red-op sum
-                        --count 1024
-                        --pin-device0 $<IF:$<BOOL:${INFINICCL_TEST_PIN_ALL_RANKS_TO_DEVICE0}>,1,0>
-                )
-                set_tests_properties(
-                    pure_mpi.all_reduce.float32.sum.count1024
-                    PROPERTIES
-                    LABELS "suite:pure_mpi;op:all_reduce;kind:reduction;dtype:float32;redop:sum;size:smoke"
-                )
+                infiniccl_add_pure_mpi_all_reduce_ctest()
             endif()
         endforeach()
     endif()

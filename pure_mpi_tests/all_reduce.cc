@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -16,17 +17,22 @@
 
 namespace {
 
+constexpr int kSkipReturnCode = 77;
+
 struct Options {
   std::string dtype = "float32";
   std::string red_op = "sum";
+  std::string test_case = "basic";
   size_t count = 1024;
   bool pin_device0 = false;
 };
 
 void PrintUsage(const char *program) {
-  std::cerr << "Usage: " << program << " --dtype <int32|float32|float64>"
+  std::cerr << "Usage: " << program
+            << " --dtype <int32|float32|float64|float16|bfloat16>"
             << " --red-op <sum|prod|max|min|avg>"
             << " --count <N>"
+            << " [--case <basic>]"
             << " [--pin-device0 <0|1>]" << std::endl;
 }
 
@@ -84,6 +90,11 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
         std::cerr << "`--count` must be a positive integer." << std::endl;
         return false;
       }
+    } else if (arg == "--case") {
+      const char *value = require_value("--case");
+      if (!value)
+        return false;
+      opts->test_case = value;
     } else if (arg == "--pin-device0") {
       const char *value = require_value("--pin-device0");
       if (!value)
@@ -119,6 +130,10 @@ bool ParseRedOp(const std::string &name, infinicclRedOp_t *op) {
   return true;
 }
 
+bool IsUnsupportedReductionDtype(const std::string &dtype) {
+  return dtype == "float16" || dtype == "bfloat16";
+}
+
 int LocalRankFromEnv() {
   const char *env_names[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID",
                              "MV2_COMM_WORLD_LOCAL_RANK"};
@@ -147,52 +162,95 @@ bool CheckInfini(infinicclResult_t result, const char *expr, int line) {
     }                                                                          \
   } while (0)
 
-template <typename T> T InputValueForRank(int rank) {
-  return static_cast<T>(rank + 1);
+double InputValueForRankAndIndex(int rank, int world_size, size_t index,
+                                 infinicclRedOp_t op) {
+  const double index_offset = static_cast<double>(index % 7);
+
+  switch (op) {
+  case infinicclProd:
+    return rank == static_cast<int>(index % static_cast<size_t>(world_size))
+               ? 2.0
+               : 1.0;
+  case infinicclAvg:
+    return 2.0 * static_cast<double>(rank + 1) + 2.0 * index_offset;
+  case infinicclSum:
+  case infinicclMax:
+  case infinicclMin:
+    return static_cast<double>(rank + 1) + index_offset;
+  default:
+    return 0.0;
+  }
 }
 
-template <typename T> T ExpectedValue(int world_size, infinicclRedOp_t op) {
-  double sum = 0.0;
-  double product = 1.0;
-  for (int rank = 0; rank < world_size; ++rank) {
-    double value = static_cast<double>(rank + 1);
-    sum += value;
-    product *= value;
-  }
+template <typename T>
+T InputValueForRankAndIndex(int rank, int world_size, size_t index,
+                            infinicclRedOp_t op) {
+  return static_cast<T>(InputValueForRankAndIndex(rank, world_size, index, op));
+}
+
+template <typename T>
+T ExpectedValueForIndex(int world_size, size_t index, infinicclRedOp_t op) {
+  double result = 0.0;
 
   switch (op) {
   case infinicclSum:
-    return static_cast<T>(sum);
-  case infinicclProd:
-    return static_cast<T>(product);
-  case infinicclMax:
-    return static_cast<T>(world_size);
-  case infinicclMin:
-    return static_cast<T>(1);
   case infinicclAvg:
-    return static_cast<T>(sum / static_cast<double>(world_size));
+    for (int rank = 0; rank < world_size; ++rank) {
+      result += InputValueForRankAndIndex(rank, world_size, index, op);
+    }
+    if (op == infinicclAvg) {
+      result /= static_cast<double>(world_size);
+    }
+    break;
+  case infinicclProd:
+    result = 1.0;
+    for (int rank = 0; rank < world_size; ++rank) {
+      result *= InputValueForRankAndIndex(rank, world_size, index, op);
+    }
+    break;
+  case infinicclMax:
+    result = InputValueForRankAndIndex(0, world_size, index, op);
+    for (int rank = 1; rank < world_size; ++rank) {
+      result = std::max(result,
+                        InputValueForRankAndIndex(rank, world_size, index, op));
+    }
+    break;
+  case infinicclMin:
+    result = InputValueForRankAndIndex(0, world_size, index, op);
+    for (int rank = 1; rank < world_size; ++rank) {
+      result = std::min(result,
+                        InputValueForRankAndIndex(rank, world_size, index, op));
+    }
+    break;
   default:
-    return static_cast<T>(0);
+    result = 0.0;
+    break;
   }
+
+  return static_cast<T>(result);
 }
 
 template <typename T> bool EqualEnough(T actual, T expected) {
   if constexpr (std::is_integral_v<T>) {
     return actual == expected;
   } else {
-    double diff =
-        std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
-    return diff <= 1e-3;
+    const double actual_value = static_cast<double>(actual);
+    const double expected_value = static_cast<double>(expected);
+    const double diff = std::fabs(actual_value - expected_value);
+    const double scale = std::max(1.0, std::fabs(expected_value));
+    return diff <= 1e-5 * scale;
   }
 }
 
 template <typename T>
-bool ValidateAllReduce(const std::vector<T> &data, T expected, int rank,
-                       const Options &opts) {
+bool ValidateAllReduce(const std::vector<T> &data, int rank, int world_size,
+                       const Options &opts, infinicclRedOp_t red_op) {
   bool correct = true;
   size_t error_count = 0;
+  T first_expected = ExpectedValueForIndex<T>(world_size, 0, red_op);
 
   for (size_t i = 0; i < data.size(); ++i) {
+    T expected = ExpectedValueForIndex<T>(world_size, i, red_op);
     if (!EqualEnough(data[i], expected)) {
       correct = false;
       ++error_count;
@@ -211,7 +269,8 @@ bool ValidateAllReduce(const std::vector<T> &data, T expected, int rank,
 
     std::cout << "\n=== AllReduce Test Results ===" << std::endl;
     std::cout << "Case: dtype=" << opts.dtype << ", red-op=" << opts.red_op
-              << ", count=" << opts.count << std::endl;
+              << ", count=" << opts.count << ", case=" << opts.test_case
+              << std::endl;
     std::cout << "Correct: "
               << (correct ? (green + std::string("YES") + reset)
                           : (red + std::string("NO") + reset));
@@ -220,7 +279,8 @@ bool ValidateAllReduce(const std::vector<T> &data, T expected, int rank,
     }
     std::cout << std::endl;
     if (!data.empty()) {
-      std::cout << "Expect:  " << static_cast<double>(expected) << std::endl;
+      std::cout << "Expect:  " << static_cast<double>(first_expected)
+                << std::endl;
       std::cout << "Actual:  " << static_cast<double>(data[0]) << std::endl;
     }
   }
@@ -242,6 +302,10 @@ int RunAllReduce(int argc, char **argv, const Options &opts,
   int world_size = 0;
   CHECK_INFINI_OR_RETURN(infinicclGetRank(&rank));
   CHECK_INFINI_OR_RETURN(infinicclGetSize(&world_size));
+  if (world_size <= 0) {
+    std::cerr << "Invalid MPI world size `" << world_size << "`." << std::endl;
+    return EXIT_FAILURE;
+  }
 
   char hostname[256];
   gethostname(hostname, sizeof(hostname));
@@ -264,11 +328,13 @@ int RunAllReduce(int argc, char **argv, const Options &opts,
     device_ids.assign(static_cast<size_t>(world_size), 0);
     device_list = device_ids.data();
   }
-  CHECK_INFINI_OR_RETURN(
-      infinicclCommInitAll(&comm, world_size, device_list));
+  CHECK_INFINI_OR_RETURN(infinicclCommInitAll(&comm, world_size, device_list));
 
-  std::vector<T> h_send(opts.count, InputValueForRank<T>(rank));
+  std::vector<T> h_send(opts.count);
   std::vector<T> h_recv(opts.count, static_cast<T>(0));
+  for (size_t i = 0; i < opts.count; ++i) {
+    h_send[i] = InputValueForRankAndIndex<T>(rank, world_size, i, red_op);
+  }
 
   T *d_send = nullptr;
   T *d_recv = nullptr;
@@ -284,8 +350,7 @@ int RunAllReduce(int argc, char **argv, const Options &opts,
   CHECK_DEVICE(GPU_SYNC());
   CHECK_DEVICE(GPU_MEMCPY_D2H(h_recv.data(), d_recv, total_bytes));
 
-  T expected = ExpectedValue<T>(world_size, red_op);
-  bool correct = ValidateAllReduce(h_recv, expected, rank, opts);
+  bool correct = ValidateAllReduce(h_recv, rank, world_size, opts, red_op);
 
   CHECK_DEVICE(GPU_FREE(d_send));
   CHECK_DEVICE(GPU_FREE(d_recv));
@@ -300,6 +365,13 @@ int RunAllReduce(int argc, char **argv, const Options &opts,
 int main(int argc, char **argv) {
   Options opts;
   if (!ParseArgs(argc, argv, &opts)) {
+    PrintUsage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  if (opts.test_case != "basic") {
+    std::cerr << "Unsupported `--case` value `" << opts.test_case << "`."
+              << std::endl;
     PrintUsage(argv[0]);
     return EXIT_FAILURE;
   }
@@ -321,9 +393,16 @@ int main(int argc, char **argv) {
   if (opts.dtype == "int32") {
     return RunAllReduce<int32_t>(argc, argv, opts, infinicclInt32, red_op);
   }
+  if (IsUnsupportedReductionDtype(opts.dtype)) {
+    std::cerr << "Skipping `" << opts.dtype
+              << "` all_reduce reduction cases because the current MPI backend "
+                 "maps fp16/bf16 to bytes instead of typed reduction values."
+              << std::endl;
+    return kSkipReturnCode;
+  }
 
-  std::cerr << "Unsupported `--dtype` value `" << opts.dtype
-            << "` in the initial all_reduce test." << std::endl;
+  std::cerr << "Unsupported `--dtype` value `" << opts.dtype << "`."
+            << std::endl;
   PrintUsage(argv[0]);
   return EXIT_FAILURE;
 }
