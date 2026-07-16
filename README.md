@@ -13,10 +13,11 @@ replacement for the main InfiniCCL README, build guide, or in-tree examples.
 The repository is still early in its test-framework setup.
 
 - `pure_mpi_tests/` contains the current MPI-backed test source.
+- CTest is wired for the initial pure MPI `all_reduce` smoke case:
+  `pure_mpi.all_reduce.float32.sum.count1024`.
 - InfiniCCL is consumed with `find_package(InfiniCCL REQUIRED)`.
 - `INFINICCL_INSTALL` is still accepted as a backward-compatible search hint,
   but new builds should prefer `CMAKE_PREFIX_PATH` or `InfiniCCL_ROOT`.
-- CTest is planned but not wired yet.
 
 ## Planned Test Layout
 
@@ -32,14 +33,13 @@ Each directory should eventually cover the same operator matrix. The current
 target is 9 operators with 10 operation scenarios per operator. Prefer one test
 file per operator so the matrix remains easy to scan and register with CTest.
 
-When CTest support is added, it should become the common entry point for local
-and CI verification:
+CTest is the common entry point for registered local and CI verification cases:
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build/nvidia --output-on-failure
 ```
 
-Until then, launch the generated test executables through `icclrun`.
+For ad hoc runs, launch generated test executables through `icclrun`.
 
 ## Prerequisites
 
@@ -90,6 +90,11 @@ icclrun --config cluster.yaml --build pure_mpi_tests/all_reduce
 The executable path is relative to `build/<arch>/`, so use
 `pure_mpi_tests/all_reduce` rather than only `all_reduce`.
 
+The CTest registration uses the same `cluster.yaml` through `icclrun`. If the
+cluster file is not named `cluster.yaml` or is not stored at the repository root,
+pass `-DINFINICCL_TEST_CLUSTER_CONFIG=/path/to/cluster.yaml` in the node
+`cmake_flags`.
+
 For non-local or heterogeneous runs, adjust `nodes`, `slots`, `cmake_flags`, and
 backend environment variables in `cluster.yaml` instead of invoking MPI
 directly.
@@ -111,6 +116,17 @@ Do not launch these tests with `mpirun` directly from this repository. `icclrun`
 generates the wrapper, hostfile, architecture-specific build path, and runtime
 environment expected by InfiniCCL.
 
+To run the registered CTest smoke case:
+
+```bash
+ctest --test-dir build/nvidia --output-on-failure \
+  -R '^pure_mpi\.all_reduce\.float32\.sum\.count1024$'
+```
+
+For a single local GPU, the default CTest registration pins all ranks to device
+0. For multi-GPU or heterogeneous runs, set
+`-DINFINICCL_TEST_PIN_ALL_RANKS_TO_DEVICE0=OFF` in the node `cmake_flags`.
+
 ## Adding Tests
 
 Use these conventions for new tests:
@@ -123,8 +139,8 @@ Use these conventions for new tests:
   `#include <infiniccl/infiniccl.h>`.
 - Link through `InfiniCCL::infiniccl`; do not vendor generated headers or commit
   local copies of `include/infiniccl.h`.
-- When CTest registration is added, update the CMake test registration in the
-  same change as the new test source.
+- When adding or expanding CTest coverage, update the CMake test registration in
+  the same change as the new test source.
 - Do not commit build directories, local binaries, logs, cluster-local
   configuration, or installed InfiniCCL artifacts.
 
