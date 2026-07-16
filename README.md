@@ -95,12 +95,28 @@ cluster file is not named `cluster.yaml` or is not stored at the repository root
 pass `-DINFINICCL_TEST_CLUSTER_CONFIG=/path/to/cluster.yaml` in the node
 `cmake_flags`.
 
+During `icclrun --build`, InfiniCCL is installed under the configured
+`install_dir`, and the external test build receives that installed prefix through
+`INFINICCL_INSTALL`. `CMakeLists.txt` uses this value only as a compatibility
+search hint for `find_package(InfiniCCL REQUIRED)`.
+
+For manual CMake builds outside `icclrun`, point CMake at the installed
+InfiniCCL prefix through standard package search variables:
+
+```bash
+cmake -S . -B build/nvidia -DUSE_CUDA=ON \
+  -DCMAKE_PREFIX_PATH=/path/to/InfiniCCL/install
+
+cmake -S . -B build/nvidia -DUSE_CUDA=ON \
+  -DInfiniCCL_ROOT=/path/to/InfiniCCL/install
+```
+
 For non-local or heterogeneous runs, adjust `nodes`, `slots`, `cmake_flags`, and
 backend environment variables in `cluster.yaml` instead of invoking MPI
 directly.
 
-The tests should not manually add InfiniCCL include directories, link directly
-to `libinfiniccl.so`, or set an InfiniCCL RPATH. Those properties come from the
+The tests should not manually add InfiniCCL include directories, link directly to
+`libinfiniccl.so`, or set an InfiniCCL RPATH. Those properties come from the
 imported target `InfiniCCL::infiniccl`.
 
 ## Run
